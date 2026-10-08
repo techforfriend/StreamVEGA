@@ -1,0 +1,651 @@
+name: Build StreamX ARM64 APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build release ARM64 APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    env:
+      CI: '1'
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          cmdline-tools-version: '15859902'
+          accept-android-sdk-licenses: 'true'
+          packages: 'platform-tools'
+
+      - name: Cache Android NDK
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.ANDROID_SDK_ROOT }}/ndk/27.1.12297006
+          key: streamx-android-ndk-27.1.12297006-${{ runner.os }}
+          restore-keys: |
+            streamx-android-ndk-27.1.12297006-
+
+      - name: Install required Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          NDK_VERSION="27.1.12297006"
+          NDK_DIR="${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}"
+
+          if [ -d "$NDK_DIR" ]; then
+            echo "Android NDK ${NDK_VERSION} already available."
+          else
+            echo "Installing Android NDK ${NDK_VERSION}..."
+            sdkmanager --sdk_root="${ANDROID_SDK_ROOT}" "ndk;${NDK_VERSION}"
+          fi
+
+          echo "Installed NDK:"
+          ls -la "$NDK_DIR" | head -20
+
+      - name: Find app source directory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP_SOURCE_DIR=""
+
+          echo "===== Checking repository root ====="
+
+          if [ -f "$GITHUB_WORKSPACE/package.json" ]; then
+            APP_SOURCE_DIR="$GITHUB_WORKSPACE"
+            echo "Found package.json at repository root."
+          fi
+
+          if [ -z "$APP_SOURCE_DIR" ]; then
+            echo "===== Searching repository recursively ====="
+
+            while IFS= read -r PACKAGE_FILE; do
+              PROJECT_DIR="$(dirname "$PACKAGE_FILE")"
+
+              if [ -f "$PROJECT_DIR/app.config.js" ] ||
+                 [ -f "$PROJECT_DIR/app.json" ] ||
+                 [ -f "$PROJECT_DIR/expo.json" ]; then
+                APP_SOURCE_DIR="$PROJECT_DIR"
+                echo "Found Expo project: $APP_SOURCE_DIR"
+                break
+              fi
+            done < <(
+              find "$GITHUB_WORKSPACE" \
+                -type f \
+                -name package.json \
+                -not -path '*/node_modules/*' \
+                -not -path '*/.streamx-source/*' \
+                -print
+            )
+          fi
+
+          if [ -z "$APP_SOURCE_DIR" ]; then
+            echo "===== Searching source ZIPs recursively ====="
+
+            while IFS= read -r ZIP_FILE; do
+              echo "Inspecting ZIP: $ZIP_FILE"
+
+              if unzip -Z1 "$ZIP_FILE" 2>/dev/null |
+                 grep -qE '(^|/)package\.json$'; then
+
+                echo "package.json found inside: $ZIP_FILE"
+
+                rm -rf "$GITHUB_WORKSPACE/.streamx-source"
+                mkdir -p "$GITHUB_WORKSPACE/.streamx-source"
+
+                unzip -q "$ZIP_FILE" \
+                  -d "$GITHUB_WORKSPACE/.streamx-source"
+
+                while IFS= read -r PACKAGE_FILE; do
+                  PROJECT_DIR="$(dirname "$PACKAGE_FILE")"
+
+                  if [ -f "$PROJECT_DIR/app.config.js" ] ||
+                     [ -f "$PROJECT_DIR/app.json" ] ||
+                     [ -f "$PROJECT_DIR/expo.json" ]; then
+                    APP_SOURCE_DIR="$PROJECT_DIR"
+                    echo "Selected source ZIP: $ZIP_FILE"
+                    echo "Selected project: $APP_SOURCE_DIR"
+                    break
+                  fi
+                done < <(
+                  find "$GITHUB_WORKSPACE/.streamx-source" \
+                    -type f \
+                    -name package.json \
+                    -not -path '*/node_modules/*' \
+                    -print
+                )
+
+                if [ -z "$APP_SOURCE_DIR" ]; then
+                  PACKAGE_FILE="$(
+                    find "$GITHUB_WORKSPACE/.streamx-source" \
+                      -type f \
+                      -name package.json \
+                      -not -path '*/node_modules/*' \
+                      -print -quit
+                  )"
+
+                  if [ -n "$PACKAGE_FILE" ]; then
+                    APP_SOURCE_DIR="$(dirname "$PACKAGE_FILE")"
+                    echo "Selected source ZIP by package.json: $ZIP_FILE"
+                    echo "Selected project: $APP_SOURCE_DIR"
+                  fi
+                fi
+
+                if [ -n "$APP_SOURCE_DIR" ]; then
+                  break
+                fi
+              fi
+
+            done < <(
+              find "$GITHUB_WORKSPACE" \
+                -type f \
+                -iname '*.zip' \
+                -not -path '*/node_modules/*' \
+                -printf '%T@ %p\n' |
+              sort -nr |
+              cut -d' ' -f2-
+            )
+          fi
+
+          if [ -z "$APP_SOURCE_DIR" ] ||
+             [ ! -f "$APP_SOURCE_DIR/package.json" ]; then
+            echo "ERROR: StreamX app source was NOT found."
+            exit 1
+          fi
+
+          echo
+          echo "=============================================="
+          echo "APP SOURCE DIRECTORY:"
+          echo "$APP_SOURCE_DIR"
+          echo "=============================================="
+
+          echo "APP_SOURCE_DIR=$APP_SOURCE_DIR" >> "$GITHUB_ENV"
+
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: streamx-npm-${{ runner.os }}-${{ hashFiles('**/package.json') }}
+          restore-keys: |
+            streamx-npm-${{ runner.os }}-
+
+      - name: Install npm dependencies
+        working-directory: ${{ env.APP_SOURCE_DIR }}
+        shell: bash
+        run: |
+          set -o pipefail
+
+          npm install \
+            --legacy-peer-deps \
+            --prefer-offline \
+            --no-audit \
+            --no-fund \
+            --ignore-scripts \
+            2>&1 |
+          tee "$GITHUB_WORKSPACE/streamx-npm-install.log"
+
+      - name: Install patch-compatible dependency versions
+        working-directory: ${{ env.APP_SOURCE_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=============================================="
+          echo "Installing versions required by existing patches"
+          echo "=============================================="
+
+          npm install \
+            --legacy-peer-deps \
+            --prefer-offline \
+            --no-audit \
+            --no-fund \
+            --ignore-scripts \
+            --no-save \
+            "@dr.pogodin/react-native-fs@2.36.2" \
+            "react-native-video@6.19.2"
+
+          echo
+          echo "===== Installed versions ====="
+
+          node -e "
+            const fs = require('fs');
+
+            for (const pkg of [
+              '@dr.pogodin/react-native-fs',
+              'react-native-video'
+            ]) {
+              try {
+                const p = require.resolve(pkg + '/package.json');
+                const data = JSON.parse(fs.readFileSync(p, 'utf8'));
+                console.log(pkg + ': ' + data.version);
+              } catch (e) {
+                console.log(pkg + ': NOT FOUND');
+                process.exitCode = 1;
+              }
+            }
+          "
+
+      - name: Prepare native sharp module
+        working-directory: ${{ env.APP_SOURCE_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "===== Preparing sharp ====="
+
+          if node -e "require('sharp'); console.log('sharp native module already works.')" 2>&1; then
+            echo "sharp is ready."
+          else
+            echo "Rebuilding sharp for Linux x64..."
+
+            npm rebuild sharp \
+              --platform=linux \
+              --arch=x64
+
+            node -e "require('sharp'); console.log('sharp native module loaded successfully after rebuild.')" 2>&1
+          fi
+
+      - name: Apply patch-package patches
+        working-directory: ${{ env.APP_SOURCE_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PATCH_LOG="$GITHUB_WORKSPACE/streamx-patch-package.log"
+
+          if [ ! -x "node_modules/.bin/patch-package" ]; then
+            echo "ERROR: patch-package binary not found."
+            exit 1
+          fi
+
+          echo "===== Applying patch-package patches ====="
+
+          node_modules/.bin/patch-package 2>&1 |
+            tee "$PATCH_LOG"
+
+          echo
+          echo "===== Patch application completed ====="
+
+      - name: Verify patched dependencies
+        working-directory: ${{ env.APP_SOURCE_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "===== Verifying dependencies ====="
+
+          node -e "
+            const fs = require('fs');
+
+            const packages = [
+              '@dr.pogodin/react-native-fs',
+              'react-native-video',
+              'react-native-permissions',
+              'react-native-webview'
+            ];
+
+            for (const pkg of packages) {
+              const p = require.resolve(pkg + '/package.json');
+              const data = JSON.parse(fs.readFileSync(p, 'utf8'));
+              console.log(pkg + ': ' + data.version);
+            }
+          "
+
+          echo
+          echo "===== Verifying sharp ====="
+
+          node -e "
+            const sharp = require('sharp');
+            console.log('sharp version:', sharp.versions.sharp);
+            console.log('sharp native module: OK');
+          "
+
+      - name: Create CI signing key
+        shell: bash
+        run: |
+          set -o pipefail
+
+          keytool -genkeypair -v \
+            -keystore "$GITHUB_WORKSPACE/streamx-ci.keystore" \
+            -storepass github-build \
+            -keypass github-build \
+            -alias streamx \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=StreamX,O=StreamX,C=IN" \
+            2>&1 |
+          tee "$GITHUB_WORKSPACE/streamx-signing-key.log"
+
+          {
+            echo "MYAPP_UPLOAD_STORE_FILE=$GITHUB_WORKSPACE/streamx-ci.keystore"
+            echo "MYAPP_UPLOAD_STORE_PASSWORD=github-build"
+            echo "MYAPP_UPLOAD_KEY_ALIAS=streamx"
+            echo "MYAPP_UPLOAD_KEY_PASSWORD=github-build"
+          } >> "$GITHUB_ENV"
+
+      - name: Generate Android project
+        working-directory: ${{ env.APP_SOURCE_DIR }}
+        shell: bash
+        run: |
+          set -o pipefail
+
+          npx expo prebuild \
+            --platform android \
+            --clean \
+            --no-install \
+            2>&1 |
+          tee "$GITHUB_WORKSPACE/streamx-prebuild.log"
+
+      - name: Verify generated Android project
+        working-directory: ${{ env.APP_SOURCE_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "===== Verifying generated Android project ====="
+
+          if [ ! -d "android" ]; then
+            echo "ERROR: Generated android directory was not found."
+            exit 1
+          fi
+
+          if [ ! -f "android/gradlew" ]; then
+            echo "ERROR: android/gradlew was not generated."
+            exit 1
+          fi
+
+          if [ ! -d "android/app" ]; then
+            echo "ERROR: android/app directory was not generated."
+            exit 1
+          fi
+
+          echo "Android project generated successfully."
+
+          echo
+          echo "===== Generated native files ====="
+
+          find android/app/src/main \
+            -type f \
+            \( -name '*.kt' -o -name '*.java' \) \
+            -print 2>/dev/null |
+          sort |
+          head -150
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: streamx-gradle-${{ runner.os }}-${{ hashFiles('**/gradle-wrapper.properties', '**/*.gradle', '**/*.gradle.kts', '**/gradle.properties', '**/settings.gradle', '**/settings.gradle.kts', '**/package.json') }}
+          restore-keys: |
+            streamx-gradle-${{ runner.os }}-
+
+      - name: Configure ARM64 build
+        working-directory: ${{ env.APP_SOURCE_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat >> android/gradle.properties <<'EOF'
+          reactNativeArchitectures=arm64-v8a
+          org.gradle.caching=true
+          org.gradle.parallel=true
+          org.gradle.configureondemand=true
+          org.gradle.daemon=true
+          org.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=768m -Dfile.encoding=UTF-8
+          kotlin.daemon.jvmargs=-Xmx1536m
+          EOF
+
+      - name: Generate required React Native Codegen artifacts
+        working-directory: ${{ env.APP_SOURCE_DIR }}/android
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=============================================="
+          echo "Generating React Native Codegen artifacts"
+          echo "=============================================="
+
+          chmod +x gradlew
+
+          ./gradlew \
+            :react-native-permissions:generateCodegenSchemaFromJavaScript \
+            :react-native-permissions:generateCodegenArtifactsFromSchema \
+            :react-native-webview:generateCodegenSchemaFromJavaScript \
+            :react-native-webview:generateCodegenArtifactsFromSchema \
+            --rerun-tasks
+
+          echo
+          echo "===== Verifying Codegen JNI directories ====="
+
+          PERMISSIONS_JNI="../node_modules/react-native-permissions/android/build/generated/source/codegen/jni"
+          WEBVIEW_JNI="../node_modules/react-native-webview/android/build/generated/source/codegen/jni"
+
+          if [ ! -d "$PERMISSIONS_JNI" ]; then
+            echo "ERROR: react-native-permissions Codegen JNI directory was not generated."
+            exit 1
+          fi
+
+          if [ ! -d "$WEBVIEW_JNI" ]; then
+            echo "ERROR: react-native-webview Codegen JNI directory was not generated."
+            exit 1
+          fi
+
+          echo "react-native-permissions Codegen JNI: OK"
+          echo "react-native-webview Codegen JNI: OK"
+
+      - name: Build release ARM64 APK
+        working-directory: ${{ env.APP_SOURCE_DIR }}/android
+        shell: bash
+        run: |
+          set -o pipefail
+
+          chmod +x gradlew
+
+          CPU_CORES="$(nproc)"
+
+          echo "===== Build resources ====="
+          echo "CPU cores: ${CPU_CORES}"
+          echo "Gradle workers: ${CPU_CORES}"
+          echo
+          free -h
+          echo "==========================="
+
+          echo
+          echo "===== Starting cached/incremental release build ====="
+
+          ./gradlew :app:assembleRelease \
+            --parallel \
+            --max-workers="${CPU_CORES}" \
+            -PreactNativeArchitectures=arm64-v8a \
+            2>&1 |
+          tee "$GITHUB_WORKSPACE/streamx-gradle-build.log"
+
+      - name: Verify final APK
+        if: success()
+        working-directory: ${{ env.APP_SOURCE_DIR }}/android
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK_DIR="app/build/outputs/apk/release"
+
+          echo "===== Final APK verification ====="
+
+          if [ ! -d "$APK_DIR" ]; then
+            echo "ERROR: Release APK directory not found."
+            exit 1
+          fi
+
+          APK_COUNT="$(find "$APK_DIR" -maxdepth 1 -type f -name '*.apk' | wc -l)"
+
+          echo "APK count: $APK_COUNT"
+
+          if [ "$APK_COUNT" -eq 0 ]; then
+            echo "ERROR: No release APK was generated."
+            exit 1
+          fi
+
+          echo
+          echo "===== Generated APK ====="
+
+          find "$APK_DIR" \
+            -maxdepth 1 \
+            -type f \
+            -name '*.apk' \
+            -print |
+          sort
+
+          echo
+          echo "===== APK SHA-256 ====="
+
+          while IFS= read -r APK; do
+            echo
+            echo "APK: $APK"
+            ls -lh "$APK"
+            sha256sum "$APK"
+          done < <(
+            find "$APK_DIR" \
+              -maxdepth 1 \
+              -type f \
+              -name '*.apk' \
+              -print |
+            sort
+          )
+
+      - name: Collect error logs
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          LOG_DIR="$GITHUB_WORKSPACE/streamx-error-logs"
+          mkdir -p "$LOG_DIR"
+
+          for FILE in \
+            streamx-npm-install.log \
+            streamx-patch-package.log \
+            streamx-signing-key.log \
+            streamx-prebuild.log \
+            streamx-gradle-build.log
+          do
+            if [ -f "$GITHUB_WORKSPACE/$FILE" ]; then
+              cp "$GITHUB_WORKSPACE/$FILE" "$LOG_DIR/"
+            fi
+          done
+
+          if [ -n "${APP_SOURCE_DIR:-}" ]; then
+
+            if [ -d "$APP_SOURCE_DIR/android/build/reports/problems" ]; then
+              cp -R \
+                "$APP_SOURCE_DIR/android/build/reports/problems" \
+                "$LOG_DIR/problems-report"
+            fi
+
+            if [ -d "$APP_SOURCE_DIR/android/app/build/reports" ]; then
+              cp -R \
+                "$APP_SOURCE_DIR/android/app/build/reports" \
+                "$LOG_DIR/app-reports"
+            fi
+
+            if [ -d "$APP_SOURCE_DIR/android/build/reports" ]; then
+              cp -R \
+                "$APP_SOURCE_DIR/android/build/reports" \
+                "$LOG_DIR/build-reports"
+            fi
+          fi
+
+          {
+            echo "===== StreamX CI Diagnostic Summary ====="
+            echo "Date (UTC): $(date -u)"
+            echo "Workspace: $GITHUB_WORKSPACE"
+            echo "Source: ${APP_SOURCE_DIR:-NOT_FOUND}"
+            echo
+
+            echo "===== Java ====="
+            java -version 2>&1
+
+            echo
+            echo "===== Node ====="
+            node --version
+            npm --version
+
+            echo
+            echo "===== NDK ====="
+            echo "${ANDROID_NDK_HOME:-NOT_SET}"
+
+            echo
+            echo "===== CPU ====="
+            nproc
+
+            echo
+            echo "===== Memory ====="
+            free -h
+
+            echo
+            echo "===== ERROR / FAILURE LINES ====="
+
+            for FILE in "$LOG_DIR"/*.log; do
+              [ -f "$FILE" ] || continue
+
+              echo
+              echo "----- $(basename "$FILE") -----"
+
+              grep -nEi \
+                'error:|error |failed|failure|exception|unresolved reference|syntax error|cannot find symbol|could not|BUILD FAILED|FAILURE:|> Task .* FAILED' \
+                "$FILE" |
+              tail -300 || true
+            done
+          } > "$LOG_DIR/diagnostic-summary.txt"
+
+          echo "===== StreamX error logs collected ====="
+
+          find "$LOG_DIR" \
+            -maxdepth 3 \
+            -type f \
+            -print |
+          sort
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: StreamX-ARM64-APK
+          path: ${{ env.APP_SOURCE_DIR }}/android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload error logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: StreamX-error-logs
+          path: streamx-error-logs/
+          if-no-files-found: warn
+          retention-days: 14
